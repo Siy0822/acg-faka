@@ -67,10 +67,16 @@ class Index extends User
     public function commodity(): array
     {
         \App\Util\Schema::ensureCommodityTags();
+        \App\Util\Schema::ensureCommodityControl();
 
         $keywords = (string)$_GET['keywords'];
+        //本方法走 $_GET 直连 paginate（未过 Get::setPaginate 的钳制）：limit 为负会让 paginate 生成
+        //take(-N) 非法 SQL→500（免登录可打）。limit=0 是「返回全部」的既有约定，负数归 0(与既有行为一致、不新增面)。
         $limit = (int)$_GET['limit'];
-        $page = (int)$_GET['page'];
+        if ($limit < 0) {
+            $limit = 0;
+        }
+        $page = max(1, (int)$_GET['page']);
         $categoryId = $_GET['categoryId'];
 
         $commodity = Commodity::query()
@@ -111,7 +117,7 @@ class Index extends User
                     }
                 }
 
-                $commodity = $commodity->whereNotIn("id", $hideCommodity)->whereRaw("(`owner`=0 or `owner`={$bus->user_id})");
+                $commodity = $commodity->whereNotIn("id", $hideCommodity)->whereRaw("((`owner`=0 and `substation_disable`=0) or `owner`={$bus->user_id})");
             }
         } else {
             //主站
@@ -212,7 +218,11 @@ class Index extends User
                 //原始配置不能给前端：里面有成本价、种类单价、SKU 加价等定价结构
                 $data[$key]['config'],
                 $data[$key]['seckill_start_time'],
-                $data[$key]['seckill_end_time']
+                $data[$key]['seckill_end_time'],
+                //shared_id 只用于上面那段库存分支。它一旦出现在响应里，任何人（本接口
+                //免登录）都能一眼看出哪些商品是从别处转售来的、共几家上游——
+                //这是转售身份的泄露面，见 App\Util\SharedPayload
+                $data[$key]['shared_id']
             );
 
             if (!$val['cover']) {
@@ -229,8 +239,8 @@ class Index extends User
                 $var = $userCommodityMap[$val['id']];
 
                 if ($var->premium > 0) {
-                    $data[$key]['price'] = $var->applyRounding((new Decimal($data[$key]['price'], 2))->mul($var->premium / 100)->add($data[$key]['price'])->getAmount());
-                    $data[$key]['user_price'] = $var->applyRounding((new Decimal($data[$key]['user_price'], 2))->mul($var->premium / 100)->add($data[$key]['user_price'])->getAmount());
+                    $data[$key]['price'] = $var->markup($data[$key]['price']);
+                    $data[$key]['user_price'] = $var->markup($data[$key]['user_price']);
                 }
                 if ($var->name) {
                     $data[$key]['name'] = $var->name;
@@ -285,6 +295,9 @@ class Index extends User
         /**
          * @var Commodity $commodity
          */
+        //item_id 必须是标量：传数组会让 find([]) 返回集合，后面 ->status 抛异常→500（免登录可打）。
+        //归一化回 $map，供下方闭包 where("commodity_id",...) 与 shared 分支转发复用。
+        $map['item_id'] = is_scalar($map['item_id'] ?? null) ? (int)$map['item_id'] : 0;
         $commodity = Commodity::with(['shared'])->find($map['item_id']);
         $limit = $map['limit'] ?? 10;
 
@@ -299,6 +312,12 @@ class Index extends User
             throw new JSONException("该商品不支持预选");
         }
 
+        //限流：本接口免登录，纵深防御挡住对预选库存的高频枚举/盲注（主防线是下方 setFilterColumns 列白名单）。
+        //阈值给得比订单/卡密查询宽松，正常买家翻页+搜索预选内容够用，脚本化刷库会被拦。
+        if (Throttle::tooMany("draft:ip:" . Client::getAddress(), 60, 60)) {
+            throw new JSONException("请求过于频繁，请稍后再试");
+        }
+
         if ($commodity->shared) {
             $data = $this->shared->draftCard($commodity->shared, $commodity->shared_code, $map);
             //加价算法
@@ -311,6 +330,10 @@ class Index extends User
             $get = new Get(Card::class);
             $get->setPaginate((int)$this->request->post("page"), (int)$limit);
             $get->setWhere($map);
+            //本接口免登录、且强制 status=0（未售库存）。客户端唯一合法的过滤是「搜索可选内容」= search-draft，
+            //draft 是本就随列表返回的预览内容。若放任客户端过滤任意列，search-secret / betweenStart-secret
+            //会把 total 的 0/1 变成布尔预言机，匿名逐字符盲注拖走未售卡密的 secret。故只白名单 draft。
+            $get->setFilterColumns(['draft']);
             $get->setColumn('id', 'draft', 'draft_premium');
 
             $data = $this->query->get($get, function (Builder $builder) use ($map) {
@@ -322,6 +345,11 @@ class Index extends User
 
                 if (!empty($map['sku']) && is_array($map['sku'])) {
                     foreach ($map['sku'] as $k => $v) {
+                        //$k 来自客户端，会拼进 JSON 路径 sku->{$k}。这条 append 闭包不经 Query 的子键校验，
+                        //非法键会生成坏 JSON 路径触发 PDOException→500。按同一套 SKU 键名规则校验。
+                        if (!\App\Util\Sku::isValidKey((string)$k)) {
+                            throw new JSONException("规格参数不正确");
+                        }
                         $builder = $builder->where("sku->{$k}", $v);
                     }
                 }
@@ -383,8 +411,17 @@ class Index extends User
     {
         $commodity = Commodity::with(['shared'])->find((int)$this->request->post("item_id"));
 
+        //getItemStock 的入参不可空，商品不存在时传 null 会抛 TypeError 落到通用兜底=500。
+        //与同控制器 valuation() 一致，改为返回干净的业务错误（也避免免登录高频触发 500 与日志噪声）。
+        if (!$commodity) {
+            throw new JSONException("商品不存在");
+        }
+
         $_race = (string)$this->request->post("race");
-        $_skus = (array)$this->request->post("sku") ?: [];
+        //没选的规格（空值）不参与筛选：前台传 sku=（被 (array) 转成 [0 => ""]）或 sku[组]= 时，
+        //会去找「规格 = 空字符串」的卡密，永远是 0，有库存的商品显示「已售罄」。只在这个查询接口清掉；
+        //下单走 Order::trade 自己的规格校验，发货也按订单上的规格筛卡，两边维持一致，不在共用的 getItemStock 里改
+        $_skus = array_filter((array)$this->request->post("sku") ?: [], static fn($v): bool => $v !== '' && $v !== null);
 
         $stock = $this->shop->getItemStock($commodity, $_race, $_skus);
 
@@ -509,9 +546,12 @@ class Index extends User
         $password = (string)$this->request->post("password", flags: Filter::NORMAL);
         $ip = Client::getAddress();
 
-        //限流：挡住卡密查询密码爆破 / 订单号枚举（本接口免登录，曾被单次刷 1 万+）
+        //限流：挡住卡密查询密码爆破 / 订单号枚举（本接口免登录，曾被单次刷 1 万+）。
+        //除按 IP 外，再加一道「与 IP 无关、按订单号」的闸：否则攻击者换 IP 即可对同一订单的查单密码
+        //重新获得 8 次机会（与找回密码 forget:target 同口径的加固；代价是单个订单可被短时锁定查询）。
         if (Throttle::tooMany("secret:ip:{$ip}", 40, 600)
-            || Throttle::tooMany("secret:no:{$tradeNo}:{$ip}", 8, 600)) {
+            || Throttle::tooMany("secret:no:{$tradeNo}:{$ip}", 8, 600)
+            || Throttle::tooMany("secret:no:{$tradeNo}", 20, 600)) {
             throw new JSONException("请求过于频繁，请稍后再试");
         }
 
